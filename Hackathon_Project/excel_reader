@@ -1,0 +1,234 @@
+const XLSX = require('xlsx');
+const fs = require('fs');
+
+/**
+ * Processes the Excel file and converts it to structured JSON data
+ * This script reads the Excel file and extracts all banking data sections
+ */
+
+function parseFinancialValue(value) {
+  if (typeof value !== 'string') return value;
+  
+  // Remove currency symbols, spaces, and convert to number
+  const cleaned = value.replace(/[$TB%+\s]/g, '');
+  const numValue = parseFloat(cleaned);
+  
+  // Handle trillions
+  if (value.includes('T')) {
+    return numValue;
+  }
+  // Handle billions
+  if (value.includes('B')) {
+    return numValue;
+  }
+  // Handle percentages
+  if (value.includes('%')) {
+    return numValue;
+  }
+  
+  return numValue;
+}
+
+function processExcelFile(filePath) {
+  try {
+    console.log(`Processing Excel file: ${filePath}`);
+    
+    // Read the Excel file
+    const workbook = XLSX.readFile(filePath);
+    const sheetName = workbook.SheetNames[0]; // Assuming first sheet
+    const sheet = workbook.Sheets[sheetName];
+    
+    // Convert to array of arrays
+    const allData = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+    
+    console.log(`Found ${allData.length} rows in the sheet`);
+    
+    // Find all sections
+    const sections = [];
+    let currentSectionTitle = null;
+    
+    for (let i = 0; i < allData.length; i++) {
+      const row = allData[i];
+      
+      // Skip empty rows
+      if (!row || row.every(cell => cell === null || cell === "")) {
+        continue;
+      }
+      
+      // Check if this row has "Bank Name" as first cell (header row)
+      if (row[0] === "Bank Name") {
+        // Look back for section title
+        for (let j = i - 1; j >= 0; j--) {
+          const prevRow = allData[j];
+          if (prevRow && prevRow[0] && typeof prevRow[0] === 'string' && prevRow[0].trim() !== "") {
+            currentSectionTitle = prevRow[0];
+            break;
+          }
+        }
+        
+        // Collect data rows for this section
+        const sectionData = [];
+        for (let k = i + 1; k < allData.length; k++) {
+          const dataRow = allData[k];
+          if (!dataRow || dataRow[0] === "Bank Name") break;
+          if (dataRow[0] && typeof dataRow[0] === 'string' && 
+              dataRow[0].trim() !== "" && 
+              !dataRow[0].includes("TRENDS") &&
+              !dataRow[0].includes("ANALYSIS") &&
+              !dataRow[0].includes("SUMMARY")) {
+            sectionData.push(dataRow);
+          }
+        }
+        
+        if (sectionData.length > 0) {
+          sections.push({
+            title: currentSectionTitle || "Unknown Section",
+            headers: row,
+            rawData: sectionData
+          });
+        }
+      }
+    }
+    
+    console.log(`Found ${sections.length} data sections`);
+    
+    // Process each section into structured data
+    const processedData = {};
+    
+    sections.forEach((section, index) => {
+      console.log(`Processing section ${index + 1}: ${section.title}`);
+      
+      // Determine section type based on title
+      let sectionKey = '';
+      if (section.title.includes('REVENUE')) {
+        sectionKey = 'revenue';
+      } else if (section.title.includes('NET INCOME')) {
+        sectionKey = 'netIncome';
+      } else if (section.title.includes('TOTAL ASSETS')) {
+        sectionKey = 'totalAssets';
+      } else if (section.title.includes('ROE') || section.title.includes('EQUITY')) {
+        sectionKey = 'roe';
+      } else if (section.title.includes('MARKET CAP')) {
+        sectionKey = 'marketCap';
+      } else if (section.title.includes('STRATEGIC')) {
+        sectionKey = 'strategic';
+      } else {
+        sectionKey = `section${index + 1}`;
+      }
+      
+      const years = section.headers.slice(1, -1).filter(h => h && !isNaN(parseInt(h)));
+      const banks = [];
+      
+      section.rawData.forEach(row => {
+        const bankName = row[0];
+        if (!bankName || bankName.includes('TRENDS') || bankName.includes('ANALYSIS')) {
+          return;
+        }
+        
+        const bank = {
+          name: bankName,
+          values: [],
+          growth: row[row.length - 1] || null
+        };
+        
+        // Extract values for each year
+        for (let i = 1; i < row.length - 1; i++) {
+          if (row[i] !== null && row[i] !== undefined) {
+            bank.values.push(parseFinancialValue(row[i]));
+          }
+        }
+        
+        // Handle special cases for ROE section
+        if (sectionKey === 'roe') {
+          bank.trend = row[row.length - 1];
+          delete bank.growth;
+        }
+        
+        // Handle strategic section differently
+        if (sectionKey === 'strategic') {
+          bank.position = row[1];
+          bank.strengths = row[2];
+          bank.focus = row[3];
+          delete bank.values;
+          delete bank.growth;
+        }
+        
+        banks.push(bank);
+      });
+      
+      processedData[sectionKey] = {
+        title: section.title,
+        years: sectionKey === 'strategic' ? null : years,
+        banks: banks.filter(bank => 
+          bank.name && 
+          !bank.name.includes('TRENDS') && 
+          !bank.name.includes('ANALYSIS') &&
+          !bank.name.includes('SUMMARY') &&
+          (bank.values?.length > 0 || sectionKey === 'strategic')
+        )
+      };
+    });
+    
+    return processedData;
+    
+  } catch (error) {
+    console.error('Error processing Excel file:', error);
+    throw error;
+  }
+}
+
+function saveProcessedData(data, outputPath) {
+  try {
+    const jsonData = JSON.stringify(data, null, 2);
+    fs.writeFileSync(outputPath, jsonData);
+    console.log(`Processed data saved to: ${outputPath}`);
+    
+    // Also save a summary
+    const summary = {
+      processedAt: new Date().toISOString(),
+      sectionsFound: Object.keys(data).length,
+      sections: Object.keys(data).map(key => ({
+        key,
+        title: data[key].title,
+        banksCount: data[key].banks.length
+      }))
+    };
+    
+    const summaryPath = outputPath.replace('.json', '_summary.json');
+    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
+    console.log(`Processing summary saved to: ${summaryPath}`);
+    
+  } catch (error) {
+    console.error('Error saving processed data:', error);
+    throw error;
+  }
+}
+
+// CLI usage
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  
+  if (args.length < 1) {
+    console.log('Usage: node data_processor.js <excel_file_path> [output_path]');
+    console.log('Example: node data_processor.js ./complete_analysis.xlsx ./banking_data.json');
+    process.exit(1);
+  }
+  
+  const inputPath = args[0];
+  const outputPath = args[1] || './processed_banking_data.json';
+  
+  try {
+    const processedData = processExcelFile(inputPath);
+    saveProcessedData(processedData, outputPath);
+    console.log('Processing completed successfully!');
+  } catch (error) {
+    console.error('Processing failed:', error.message);
+    process.exit(1);
+  }
+}
+
+module.exports = {
+  processExcelFile,
+  saveProcessedData,
+  parseFinancialValue
+};
